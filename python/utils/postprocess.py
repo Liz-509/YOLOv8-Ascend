@@ -134,8 +134,7 @@ def postprocess_seg(
 
     mask_pred = mask_predictions[indices]
 
-    # 性能待优化(CUDA加速)
-    detect_results.masks = process_mask_output(mask_pred, outputs1, np.array(detect_results.boxes), orig_shape, input_shape, ratio, pad)
+    detect_results.masks = process_mask_output_ascend(mask_pred, outputs1, np.array(detect_results.boxes), orig_shape, input_shape, ratio, pad)
 
     return detect_results
 

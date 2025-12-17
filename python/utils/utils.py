@@ -1,6 +1,14 @@
 import math
 import numpy as np
 import cv2
+import torch
+
+
+try:
+    import torch_npu
+    ASCEND_AVAILABLE = torch.npu.is_available()
+except ImportError:
+    ASCEND_AVAILABLE = False
 
 
 def scale_image(masks, im0_shape, ratio_pad=None):
@@ -245,6 +253,90 @@ def process_mask_output(mask_predictions, mask_output, boxes, orig_shape, input_
 
         mask_maps[i, y1:y2, x1:x2] = crop_mask
 
+    return mask_maps
+
+def process_mask_output_ascend(mask_predictions, mask_output, boxes, orig_shape, input_shape, ratio, pad):
+    """
+    process_mask_output 优化版
+    使用Ascend NPU加速的mask后处理
+    核心优化：矩阵乘法 + Sigmoid计算移至NPU
+    """
+    if not ASCEND_AVAILABLE:
+        return process_mask_output(mask_predictions, mask_output, boxes, orig_shape, input_shape, ratio, pad)
+    
+    try:
+        # NPU计算核心部分（矩阵乘 + Sigmoid）
+        device = torch.device('npu:0')
+
+        # 使用pin_memory加速传输
+        mask_pred_tensor = torch.from_numpy(mask_predictions.astype(np.float32, copy=False))
+        mask_out_tensor = torch.from_numpy(np.squeeze(mask_output).astype(np.float32, copy=False))
+
+        # 异步传输到NPU
+        mask_pred_npu = mask_pred_tensor.npu(non_blocking=True)
+        mask_out_npu = mask_out_tensor.npu(non_blocking=True)
+        
+        #矩阵乘法 + Sigmoid（融合执行）
+        num_mask, mh, mw = mask_out_npu.shape
+        masks_npu = torch.sigmoid(
+            mask_pred_npu @ mask_out_npu.view(num_mask, -1)
+        ).view(-1, mh, mw)
+        
+        # 同步并取回结果
+        masks = masks_npu.cpu().numpy()
+        
+    except Exception as e:
+        return process_mask_output(mask_predictions, mask_output, boxes, orig_shape, input_shape, ratio, pad)
+    
+    # CPU后处理 几何变换 + resize
+    return _cpu_postprocess_masks(masks, boxes, orig_shape, input_shape, ratio, pad)
+
+def _cpu_postprocess_masks(masks, boxes, orig_shape, input_shape, ratio, pad):
+    """CPU后处理：缩放、裁剪、resize、二值化"""
+    num_boxes = len(masks)
+    if num_boxes == 0:
+        return []
+    
+    input_h, input_w = input_shape
+    mh, mw = masks.shape[1:]
+    
+    # 计算从输入图到Mask原型的缩放比例
+    proto_r = min(mh / input_h, mw / input_w)
+    pad_w_proto, pad_h_proto = pad[0] * proto_r, pad[1] * proto_r
+    
+    # 缩放边界框并添加pad
+    scale_boxes = boxes * (ratio * proto_r)
+    scale_boxes[:, [0, 2]] += pad_w_proto
+    scale_boxes[:, [1, 3]] += pad_h_proto
+    
+    mask_maps = np.zeros((num_boxes, orig_shape[0], orig_shape[1]), dtype=np.uint8)
+    
+    for i in range(num_boxes):
+        # 获取裁剪区域（在mask原型空间）
+        x1s, y1s, x2s, y2s = map(int, [
+            math.floor(scale_boxes[i][0]), math.floor(scale_boxes[i][1]),
+            math.ceil(scale_boxes[i][2]), math.ceil(scale_boxes[i][3])
+        ])
+        
+        # 获取目标区域（在原图空间）
+        x1, y1, x2, y2 = map(int, [
+            math.floor(boxes[i][0]), math.floor(boxes[i][1]),
+            math.ceil(boxes[i][2]), math.ceil(boxes[i][3])
+        ])
+        
+        # 边界安全检查
+        if x2s <= x1s or y2s <= y1s or x2 <= x1 or y2 <= y1:
+            continue
+        
+        # 裁剪、resize、二值化
+        crop_mask = masks[i][y1s:y2s, x1s:x2s]
+        if crop_mask.size == 0:
+            continue
+        
+        resized_mask = cv2.resize(crop_mask, (x2 - x1, y2 - y1), 
+                                  interpolation=cv2.INTER_LINEAR)
+        mask_maps[i, y1:y2, x1:x2] = (resized_mask > 0.5).astype(np.uint8)
+    
     return mask_maps
 
 def sigmoid(x):
