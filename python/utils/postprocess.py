@@ -165,7 +165,7 @@ def postprocess_obb(
     """
     outputs = outputs[0]
     outputs = np.squeeze(outputs)   # (5+nc+1, N)
-    nc = outputs.shape[0] - 6
+    nc = outputs.shape[0] - 5
 
     boxes = outputs[:4, :].T    # (N, 4)  xywh
     angles = outputs[-1, :] # (N,)
